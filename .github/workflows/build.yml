@@ -15,21 +15,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos, linux, windows-lcow, windows-wcow]
+        config: [macos, linux, windows-lcow, windows-wcow]
         include:
-          - os: macos
+          - config: macos
+            os: macos
             runner: macos-latest
             no_docker: "true"
             pack_bin: pack
-          - os: linux
+          - config: linux
+            os: linux
             runner: ubuntu-latest
             no_docker: "false"
             pack_bin: pack
-          - os: windows-lcow
+          - config: windows-lcow
+            os: windows
             runner: [self-hosted, windows]
             no_docker: "false"
             pack_bin: pack.exe
-          - os: windows-wcow
+          - config: windows-wcow
+            os: windows
             runner: windows-latest
             no_docker: "false"
             pack_bin: pack.exe
@@ -47,14 +51,14 @@ jobs:
       - name: Set up go
         uses: actions/setup-go@v2-beta
         with:
-          go-version: '1.13'
+          go-version: '1.14'
       - name: Set up go env
         run: |
           echo "::set-env name=GOPATH::$(go env GOPATH)"
           echo "::add-path::$(go env GOPATH)/bin"
       - name: Verify
         # disabled for windows due to format verification failing
-        if: ${{ !contains(matrix.os, 'windows') }}
+        if: matrix.os != 'windows'
         run: make verify
       - name: Test
         env:
@@ -71,6 +75,7 @@ jobs:
         env:
           PACK_BUILD: ${{ github.run_number }}
       - uses: actions/upload-artifact@v1
+        if: matrix.config != 'windows-wcow'
         with:
           name: pack-${{ matrix.os }}
           path: out/${{ env.PACK_BIN }}
@@ -79,9 +84,14 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v2
       - name: Derive pack version from branch name
         run: |
           [[ $GITHUB_REF =~ ^refs\/heads\/release/(.*)$ ]] && version=${BASH_REMATCH[1]}
+          if [[ -z "${version}" ]]; then
+            echo "pack version not detected."
+            exit 1
+          fi
           echo "::set-env name=PACK_VERSION::$version"
         shell: bash
       - name: Download artifacts - macos
@@ -95,8 +105,7 @@ jobs:
       - name: Download artifacts - windows
         uses: actions/download-artifact@v1
         with:
-          name: pack-windows-lcow
-          path: pack-windows
+          name: pack-windows
       - name: Package artifacts - macos
         run: |
           chmod +x pack-macos/pack
@@ -114,7 +123,7 @@ jobs:
           echo "::set-output name=version::$LIFECYCLE_VERSION"
       - name: Extract pack help
         id: pack_help
-        # Replacements have to do with multiline output. 
+        # Replacements have to do with multiline output.
         # See https://github.community/t5/GitHub-Actions/set-output-Truncates-Multiline-Strings/m-p/38372/highlight/true#M3322
         run: |
           PACK_HELP=$(./pack-linux/pack --help)
@@ -122,6 +131,15 @@ jobs:
           PACK_HELP="${PACK_HELP//$'\n'/'%0A'}"
           PACK_HELP="${PACK_HELP//$'\r'/'%0D'}"
           echo "::set-output name=help::$PACK_HELP"
+      - uses: actions/github-script@v1
+        id: changelog
+        with:
+          github-token: ${{secrets.GITHUB_TOKEN}}
+          result-encoding: string
+          script: |
+            const path = require('path');
+            const scriptPath = path.resolve('.github/workflows/build/changelog.js');
+            require(scriptPath)({core, github, context});
       - name: Create Release
         id: create_release
         uses: actions/create-release@latest
@@ -142,23 +160,36 @@ jobs:
 
             ## Install
 
+            #### macOS
+
             If you're on macOS, you can use Homebrew:
 
             ```bash
             $ brew install buildpacks/tap/pack
             ```
 
+            #### Linux
+
+            On Linux you can use the one of the following methods of installation.
+
+            ##### Arch Linux
+
+            - [pack-cli](https://aur.archlinux.org/packages/pack-cli/)
+            - [pack-cli-bin](https://aur.archlinux.org/packages/pack-cli-bin/)
+
+            ##### Command
+
+            ```bash
+            (export GH=buildpacks/pack; export LATEST=$(curl -s https://api.github.com/repos/$GH/releases/latest | grep -o -E "https://.+?-linux.tgz"); echo "$LATEST"; curl -sSL "$LATEST" | sudo tar -C /usr/local/bin/ --no-same-owner -xzv $(basename $GH))
+            ```
+
+            #### Others
+
             Otherwise:
 
             1. Download the `.tgz` or `.zip` file for your platform
             2. Extract the `pack` binary
             3. (Optional) Add the directory containing `pack` to `PATH`, or copy `pack` to a directory like `/usr/local/bin`
-            
-            On Linux you can use the following command:
-            
-            ```bash
-            (export GH=buildpacks/pack; export LATEST=$(curl -s https://api.github.com/repos/$GH/releases/latest | grep -o -E "https://.+?-linux.tgz"); echo "$LATEST"; curl -sSL "$LATEST" | sudo tar -C /usr/local/bin/ --no-same-owner -xzv $(basename $GH))
-            ```
 
             ## Run
 
@@ -174,11 +205,7 @@ jobs:
 
             Builders created with this release of the pack CLI continue to contain [lifecycle v${{ steps.lifecycle_version.outputs.version }}](https://github.com/buildpack/lifecycle/releases/tag/v${{ steps.lifecycle_version.outputs.version }}) by default.
 
-            ## Features
-
-            ## Fixes
-
-            ## Breaking Changes
+            ${{ steps.changelog.outputs.contents }}
       - name: Upload Release Asset - macos
         uses: actions/upload-release-asset@v1
         env:

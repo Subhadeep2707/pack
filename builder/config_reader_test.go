@@ -42,11 +42,19 @@ func testConfig(t *testing.T, when spec.G, it spec.S) {
 			it.Before(func() {
 				h.AssertNil(t, ioutil.WriteFile(builderConfigPath, []byte(`
 [[buildpacks]]
-  id = "some.buildpack"
+  id = "buildpack/1"
+  version = "0.0.1"
+  uri = "https://example.com/buildpack-1.tgz"
+
+[[buildpacks]]
+  image = "example.com/buildpack:2"
+
+[[buildpacks]]
+  uri = "https://example.com/buildpack-3.tgz"
 
 [[order]]
 [[order.group]]
-  id = "some.buildpack"
+  id = "buildpack/1"
 `), 0666))
 			})
 
@@ -54,7 +62,21 @@ func testConfig(t *testing.T, when spec.G, it spec.S) {
 				builderConfig, warns, err := builder.ReadConfig(builderConfigPath)
 				h.AssertNil(t, err)
 				h.AssertEq(t, len(warns), 0)
-				h.AssertEq(t, builderConfig.Buildpacks[0].ID, "some.buildpack")
+
+				h.AssertEq(t, builderConfig.Buildpacks[0].ID, "buildpack/1")
+				h.AssertEq(t, builderConfig.Buildpacks[0].Version, "0.0.1")
+				h.AssertEq(t, builderConfig.Buildpacks[0].URI, "https://example.com/buildpack-1.tgz")
+				h.AssertEq(t, builderConfig.Buildpacks[0].ImageName, "")
+
+				h.AssertEq(t, builderConfig.Buildpacks[1].ID, "")
+				h.AssertEq(t, builderConfig.Buildpacks[1].URI, "")
+				h.AssertEq(t, builderConfig.Buildpacks[1].ImageName, "example.com/buildpack:2")
+
+				h.AssertEq(t, builderConfig.Buildpacks[2].ID, "")
+				h.AssertEq(t, builderConfig.Buildpacks[2].URI, "https://example.com/buildpack-3.tgz")
+				h.AssertEq(t, builderConfig.Buildpacks[2].ImageName, "")
+
+				h.AssertEq(t, builderConfig.Order[0].Group[0].ID, "buildpack/1")
 			})
 		})
 
@@ -135,6 +157,41 @@ uri = "noop-buildpack.tgz"
 					h.AssertError(t, err, "unknown configuration element 'buidlpack'")
 				})
 			})
+		})
+	})
+
+	when("#ValidateConfig()", func() {
+		var (
+			testID         = "testID"
+			testRunImage   = "test-run-image"
+			testBuildImage = "test-build-image"
+		)
+
+		it("returns error if no id", func() {
+			config := builder.Config{
+				Stack: builder.StackConfig{
+					BuildImage: testBuildImage,
+					RunImage:   testRunImage,
+				}}
+			h.AssertError(t, builder.ValidateConfig(config), "stack.id is required")
+		})
+
+		it("returns error if no build image", func() {
+			config := builder.Config{
+				Stack: builder.StackConfig{
+					ID:       testID,
+					RunImage: testRunImage,
+				}}
+			h.AssertError(t, builder.ValidateConfig(config), "stack.build-image is required")
+		})
+
+		it("returns error if no run image", func() {
+			config := builder.Config{
+				Stack: builder.StackConfig{
+					ID:         testID,
+					BuildImage: testBuildImage,
+				}}
+			h.AssertError(t, builder.ValidateConfig(config), "stack.run-image is required")
 		})
 	})
 }

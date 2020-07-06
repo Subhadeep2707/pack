@@ -12,13 +12,13 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/Masterminds/semver"
 	"github.com/buildpacks/imgutil"
 	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/volume/mounts"
 	"github.com/google/go-containerregistry/pkg/name"
 	"github.com/pkg/errors"
 
-	"github.com/buildpacks/pack/cmd"
 	"github.com/buildpacks/pack/internal/api"
 	"github.com/buildpacks/pack/internal/archive"
 	"github.com/buildpacks/pack/internal/build"
@@ -32,6 +32,8 @@ import (
 	"github.com/buildpacks/pack/internal/stringset"
 	"github.com/buildpacks/pack/internal/style"
 )
+
+const lifecycleImageRepo = "buildpacksio/lifecycle"
 
 type Lifecycle interface {
 	Execute(ctx context.Context, opts build.LifecycleOptions) error
@@ -48,6 +50,7 @@ type BuildOptions struct {
 	Publish            bool
 	NoPull             bool
 	ClearCache         bool
+	TrustBuilder       bool
 	Buildpacks         []string
 	ProxyConfig        *ProxyConfig // defaults to  environment proxy vars
 	ContainerConfig    ContainerConfig
@@ -129,7 +132,7 @@ func (c *Client) Build(ctx context.Context, opts BuildOptions) error {
 		}
 	}
 	if !supportsPlatform {
-		c.logger.Debugf("pack %s supports Platform API version(s): %s", cmd.Version, strings.Join(build.SupportedPlatformAPIVersions, ", "))
+		c.logger.Debugf("pack %s supports Platform API version(s): %s", Version, strings.Join(build.SupportedPlatformAPIVersions, ", "))
 		c.logger.Debugf("Builder %s has Platform API version: %s", style.Symbol(opts.Builder), lcPlatformAPIVersion)
 		return errors.Errorf("Builder %s is incompatible with this version of pack", style.Symbol(opts.Builder))
 	}
@@ -139,13 +142,16 @@ func (c *Client) Build(ctx context.Context, opts BuildOptions) error {
 		return err
 	}
 
-	return c.lifecycle.Execute(ctx, build.LifecycleOptions{
+	lifecycleOpts := build.LifecycleOptions{
 		AppPath:            appPath,
 		Image:              imageRef,
 		Builder:            ephemeralBuilder,
 		RunImage:           runImageName,
 		ClearCache:         opts.ClearCache,
 		Publish:            opts.Publish,
+		UseCreator:         false,
+		TrustBuilder:       opts.TrustBuilder,
+		LifecycleImage:     ephemeralBuilder.Name(),
 		HTTPProxy:          proxyConfig.HTTPProxy,
 		HTTPSProxy:         proxyConfig.HTTPSProxy,
 		NoProxy:            proxyConfig.NoProxy,
@@ -153,7 +159,40 @@ func (c *Client) Build(ctx context.Context, opts BuildOptions) error {
 		Volumes:            platformVolumes,
 		DefaultProcessType: opts.DefaultProcessType,
 		FileFilter:         opts.FileFilter,
-	})
+	}
+
+	lifecycleVersion := ephemeralBuilder.LifecycleDescriptor().Info.Version
+	// Technically the creator is supported as of platform API version 0.3 (lifecycle version 0.7.0+) but earlier versions
+	// have bugs that make using the creator problematic.
+	lifecycleSupportsCreator := !lifecycleVersion.LessThan(semver.MustParse("0.7.4"))
+
+	if lifecycleSupportsCreator && opts.TrustBuilder {
+		lifecycleOpts.UseCreator = true
+		// no need to fetch a lifecycle image, it won't be used
+		return c.lifecycle.Execute(ctx, lifecycleOpts)
+	}
+
+	lifecycleImageSupported := lifecycleVersion.Equal(builder.VersionMustParse("0.6.1")) || !lifecycleVersion.LessThan(semver.MustParse("0.7.5"))
+	if !opts.TrustBuilder {
+		switch lifecycleImageSupported {
+		case true:
+			lifecycleImage, err := c.imageFetcher.Fetch(
+				ctx,
+				fmt.Sprintf("%s:%s", lifecycleImageRepo, lifecycleVersion.String()),
+				true,
+				!opts.NoPull,
+			)
+			if err != nil {
+				return errors.Wrap(err, "fetching lifecycle image")
+			}
+
+			lifecycleOpts.LifecycleImage = lifecycleImage.Name()
+		default:
+			return errors.Errorf("Lifecycle %s does not have an associated lifecycle image. Builder must be trusted.", lifecycleVersion.String())
+		}
+	}
+
+	return c.lifecycle.Execute(ctx, lifecycleOpts)
 }
 
 func (c *Client) processBuilderName(builderName string) (name.Reference, error) {
@@ -562,7 +601,7 @@ func (c *Client) createEphemeralBuilder(rawBuilderImage imgutil.Image, env map[s
 		bldr.SetOrder(order)
 	}
 
-	if err := bldr.Save(c.logger); err != nil {
+	if err := bldr.Save(c.logger, builder.CreatorMetadata{Version: Version}); err != nil {
 		return nil, err
 	}
 	return bldr, nil

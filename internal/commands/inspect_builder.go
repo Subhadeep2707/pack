@@ -26,7 +26,7 @@ func InspectBuilder(logger logging.Logger, cfg config.Config, client PackClient)
 		RunE: logError(logger, func(cmd *cobra.Command, args []string) error {
 			if cfg.DefaultBuilder == "" && len(args) == 0 {
 				suggestSettingBuilder(logger, client)
-				return MakeSoftError()
+				return pack.NewSoftError()
 			}
 
 			imageName := cfg.DefaultBuilder
@@ -34,8 +34,9 @@ func InspectBuilder(logger logging.Logger, cfg config.Config, client PackClient)
 				imageName = args[0]
 			}
 
-			presentRemote, remoteOutput, remoteWarnings, remoteErr := inspectBuilderOutput(client, cfg, imageName, false)
-			presentLocal, localOutput, localWarnings, localErr := inspectBuilderOutput(client, cfg, imageName, true)
+			verbose := logger.IsVerbose()
+			presentRemote, remoteOutput, remoteWarnings, remoteErr := inspectBuilderOutput(client, cfg, imageName, false, verbose)
+			presentLocal, localOutput, localWarnings, localErr := inspectBuilderOutput(client, cfg, imageName, true, verbose)
 
 			if !presentRemote && !presentLocal {
 				return errors.New(fmt.Sprintf("Unable to find builder '%s' locally or remotely.\n", imageName))
@@ -72,7 +73,7 @@ func InspectBuilder(logger logging.Logger, cfg config.Config, client PackClient)
 	return cmd
 }
 
-func inspectBuilderOutput(client PackClient, cfg config.Config, imageName string, local bool) (present bool, output string, warning []string, err error) {
+func inspectBuilderOutput(client PackClient, cfg config.Config, imageName string, local bool, verbose bool) (present bool, output string, warning []string, err error) {
 	source := "remote"
 	if local {
 		source = "local"
@@ -88,7 +89,7 @@ func inspectBuilderOutput(client PackClient, cfg config.Config, imageName string
 	}
 
 	var buf bytes.Buffer
-	warnings, err := generateBuilderOutput(&buf, imageName, cfg, *info)
+	warnings, err := generateBuilderOutput(&buf, imageName, cfg, *info, verbose)
 	if err != nil {
 		return true, "", nil, errors.Wrapf(err, "writing output for %s image '%s'", source, imageName)
 	}
@@ -96,7 +97,7 @@ func inspectBuilderOutput(client PackClient, cfg config.Config, imageName string
 	return true, buf.String(), warnings, nil
 }
 
-func generateBuilderOutput(writer io.Writer, imageName string, cfg config.Config, info pack.BuilderInfo) (warnings []string, err error) {
+func generateBuilderOutput(writer io.Writer, imageName string, cfg config.Config, info pack.BuilderInfo, verbose bool) (warnings []string, err error) {
 	tpl := template.Must(template.New("").Parse(`
 {{ if ne .Info.Description "" -}}
 Description: {{ .Info.Description }}
@@ -110,13 +111,17 @@ Created By:
 
 {{ end -}}
 
+Trusted: {{.Trusted}}
+
 Stack:
   ID: {{ .Info.Stack }}
+{{- if .Verbose}}
 {{- if ne (len .Info.Mixins) 0 }}
   Mixins:
 {{- end }}
 {{- range $index, $mixin := .Info.Mixins }}
     {{ $mixin }}
+{{- end }}
 {{- end }}
 
 Lifecycle:
@@ -189,16 +194,42 @@ Detection Order:
 		warnings = append(warnings, fmt.Sprintf("%s does not specify lifecycle platform api version", style.Symbol(imageName)))
 	}
 
+	trusted := false
+	for _, builder := range suggestedBuilders {
+		if builder.Image == imageName {
+			trusted = true
+			break
+		}
+	}
+
+	if !trusted {
+		for _, builder := range cfg.TrustedBuilders {
+			if builder.Name == imageName {
+				trusted = true
+				break
+			}
+		}
+	}
+
+	trustedString := "No"
+	if trusted {
+		trustedString = "Yes"
+	}
+
 	return warnings, tpl.Execute(writer, &struct {
 		Info       pack.BuilderInfo
 		Buildpacks string
 		RunImages  string
 		Order      string
+		Verbose    bool
+		Trusted    string
 	}{
 		info,
 		bps,
 		runImgs,
 		order,
+		verbose,
+		trustedString,
 	})
 }
 

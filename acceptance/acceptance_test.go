@@ -61,7 +61,7 @@ type testWriter struct {
 }
 
 func (w *testWriter) Write(p []byte) (n int, err error) {
-	w.t.Log(string(p))
+	w.t.Logf(string(p))
 	return len(p), nil
 }
 
@@ -263,13 +263,14 @@ func testWithoutSpecificBuilderRequirement(
 
 	when("suggest-builders", func() {
 		it("displays suggested builders", func() {
-			cmd := subjectPack("suggest-builders")
-			output, err := cmd.CombinedOutput()
-			if err != nil {
-				t.Fatalf("suggest-builders command failed: %s: %s", output, err)
-			}
-			h.AssertContains(t, string(output), "Suggested builders:")
-			h.AssertContains(t, string(output), "cloudfoundry/cnb:bionic")
+			output := h.Run(t, subjectPack("suggest-builders"))
+
+			h.AssertContains(t, output, "Suggested builders:")
+			h.AssertMatch(t, output, `Google:\s+'gcr.io/buildpacks/builder'`)
+			h.AssertMatch(t, output, `Heroku:\s+'heroku/buildpacks:18'`)
+			h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:base'`)
+			h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:full-cf'`)
+			h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:tiny'`)
 		})
 	})
 
@@ -286,8 +287,50 @@ func testWithoutSpecificBuilderRequirement(
 
 	when("set-default-builder", func() {
 		it("sets the default-stack-id in ~/.pack/config.toml", func() {
-			output := h.Run(t, subjectPack("set-default-builder", "cloudfoundry/cnb:bionic"))
-			h.AssertContains(t, output, "Builder 'cloudfoundry/cnb:bionic' is now the default builder")
+			output := h.Run(t, subjectPack("set-default-builder", "gcr.io/paketo-buildpacks/builder:base"))
+			h.AssertContains(t, output, "Builder 'gcr.io/paketo-buildpacks/builder:base' is now the default builder")
+		})
+	})
+
+	when("trust-builder", func() {
+		it("sets the builder as trusted in ~/.pack/config.toml", func() {
+			h.SkipIf(t, !packSupports(packPath, "trust-builder"), "pack does not support 'trust-builder'")
+			builderName := "some-builder" + h.RandString(10)
+
+			h.Run(t, subjectPack("trust-builder", builderName))
+
+			packConfigFileContents, err := ioutil.ReadFile(filepath.Join(packHome, "config.toml"))
+			h.AssertNil(t, err)
+			h.AssertContains(t, string(packConfigFileContents), builderName)
+		})
+	})
+
+	when("list-trusted-builders", func() {
+		it.Before(func() {
+			h.SkipIf(t,
+				!packSupports(packPath, "list-trusted-builders"),
+				"pack does not support 'list-trusted-builders",
+			)
+		})
+
+		it("shows default builders from pack suggest-builders", func() {
+			output := h.Run(t, subjectPack("list-trusted-builders"))
+
+			h.AssertContains(t, output, "Trusted Builders:")
+			h.AssertContains(t, output, "gcr.io/buildpacks/builder")
+			h.AssertContains(t, output, "heroku/buildpacks:18")
+			h.AssertContains(t, output, "gcr.io/paketo-buildpacks/builder:base")
+			h.AssertContains(t, output, "gcr.io/paketo-buildpacks/builder:full-cf")
+			h.AssertContains(t, output, "gcr.io/paketo-buildpacks/builder:tiny")
+		})
+
+		it("shows a builder trusted by pack trust-builder", func() {
+			builderName := "some-builder" + h.RandString(10)
+
+			h.Run(t, subjectPack("trust-builder", builderName))
+
+			output := h.Run(t, subjectPack("list-trusted-builders"))
+			h.AssertContains(t, output, builderName)
 		})
 	})
 
@@ -474,7 +517,7 @@ func testWithoutSpecificBuilderRequirement(
 
 		when("default builder is set", func() {
 			it.Before(func() {
-				h.Run(t, subjectPack("set-default-builder", "cloudfoundry/cnb:bionic"))
+				h.Run(t, subjectPack("set-default-builder", "gcr.io/paketo-buildpacks/builder:base"))
 			})
 
 			it("outputs information", func() {
@@ -486,13 +529,29 @@ func testWithoutSpecificBuilderRequirement(
 				outputTemplate := filepath.Join(packFixturesDir, "report_output.txt")
 				expectedOutput := fillTemplate(t, outputTemplate,
 					map[string]interface{}{
-						"DefaultBuilder": "cloudfoundry/cnb:bionic",
+						"DefaultBuilder": "gcr.io/paketo-buildpacks/builder:base",
 						"Version":        version,
 						"OS":             runtime.GOOS,
 						"Arch":           runtime.GOARCH,
 					},
 				)
 				h.AssertEq(t, output, expectedOutput)
+			})
+		})
+	})
+
+	when("build", func() {
+		when("default builder is not set", func() {
+			it("informs the user", func() {
+				cmd := subjectPack("build", "some/image", "-p", filepath.Join("testdata", "mock_app"))
+				output, err := h.RunE(cmd)
+				h.AssertNotNil(t, err)
+				h.AssertContains(t, output, `Please select a default builder with:`)
+				h.AssertMatch(t, output, `Google:\s+'gcr.io/buildpacks/builder'`)
+				h.AssertMatch(t, output, `Heroku:\s+'heroku/buildpacks:18'`)
+				h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:base'`)
+				h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:full-cf'`)
+				h.AssertMatch(t, output, `Paketo Buildpacks:\s+'gcr.io/paketo-buildpacks/builder:tiny'`)
 			})
 		})
 	})
@@ -560,14 +619,46 @@ func testAcceptance(
 				h.SkipIf(t, dockerHostOS() != "windows", "The current Docker daemon does not support Windows-based containers")
 			})
 
-			it("succeeds", func() {
-				builderName := createBuilder(t, runImageMirror, configDir, packCreateBuilderPath, lifecyclePath, lifecycleDescriptor)
-				defer h.DockerRmi(dockerCli, builderName)
+			when("experimental is disabled", func() {
+				it("fails", func() {
+					builderName, err := createBuilder(t, runImageMirror, configDir, "", packCreateBuilderPath, lifecyclePath, lifecycleDescriptor)
+					if err != nil {
+						defer h.DockerRmi(dockerCli, builderName)
+						h.AssertError(t, err, "Windows containers support is currently experimental")
+					}
+				})
+			})
 
-				inspect, _, err := dockerCli.ImageInspectWithRaw(context.TODO(), builderName)
-				h.AssertNil(t, err)
+			when("experimental is enabled", func() {
 
-				h.AssertEq(t, inspect.Os, "windows")
+				var packCreateBuilderHome string
+
+				it.Before(func() {
+					var err error
+					packCreateBuilderHome, err = ioutil.TempDir("", "pack-home")
+					h.AssertNil(t, err)
+
+					h.AssertNil(t, ioutil.WriteFile(
+						filepath.Join(packCreateBuilderHome, "config.toml"),
+						[]byte("experimental=true"),
+						os.ModePerm,
+					))
+				})
+
+				it.After(func() {
+					h.AssertNil(t, os.RemoveAll(packCreateBuilderHome))
+				})
+
+				it("succeeds", func() {
+					builderName, err := createBuilder(t, runImageMirror, configDir, packCreateBuilderHome, packCreateBuilderPath, lifecyclePath, lifecycleDescriptor)
+					h.AssertNil(t, err)
+					defer h.DockerRmi(dockerCli, builderName)
+
+					inspect, _, err := dockerCli.ImageInspectWithRaw(context.TODO(), builderName)
+					h.AssertNil(t, err)
+
+					h.AssertEq(t, inspect.Os, "windows")
+				})
 			})
 		})
 
@@ -586,7 +677,7 @@ func testAcceptance(
 
 				key := taskKey("create-builder", runImageMirror, configDir, packCreateBuilderPath, lifecyclePath)
 				value, err := suiteManager.RunTaskOnceString(key, func() (string, error) {
-					return createBuilder(t, runImageMirror, configDir, packCreateBuilderPath, lifecyclePath, lifecycleDescriptor), nil
+					return createBuilder(t, runImageMirror, configDir, "", packCreateBuilderPath, lifecyclePath, lifecycleDescriptor)
 				})
 				h.AssertNil(t, err)
 				suiteManager.RegisterCleanUp("clean-"+key, func() error {
@@ -638,14 +729,64 @@ func testAcceptance(
 					launchCacheVolume.Clear(context.TODO())
 				})
 
+				when("builder is untrusted", func() {
+					var untrustedBuilderName string
+
+					it.Before(func() {
+						var err error
+						untrustedBuilderName, err = createBuilder(t, runImageMirror, configDir, "", packCreateBuilderPath, lifecyclePath, lifecycleDescriptor)
+						h.AssertNil(t, err)
+					})
+
+					it.After(func() {
+						h.DockerRmi(dockerCli, untrustedBuilderName)
+					})
+
+					it("uses the 5 phases", func() {
+						output := h.Run(t, subjectPack(
+							"build", repoName,
+							"-p", filepath.Join("testdata", "mock_app"),
+							"-B", untrustedBuilderName,
+						))
+
+						lifecycleImageRequired := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
+						if lifecycleImageRequired {
+							h.AssertContains(t, output, "buildpacksio/lifecycle")
+						}
+						h.AssertContains(t, output, "[detector]")
+						h.AssertContains(t, output, "[analyzer]")
+						h.AssertContains(t, output, "[builder]")
+						h.AssertContains(t, output, "[exporter]")
+						h.AssertContains(t, output, fmt.Sprintf("Successfully built image '%s'", repoName))
+					})
+				})
+
 				when("default builder is set", func() {
+					var usingCreator bool
+
 					it.Before(func() {
 						h.Run(t, subjectPack("set-default-builder", builderName))
+
+						var trustBuilder bool
+						if packSupports(packPath, "trust-builder") {
+							h.Run(t, subjectPack("trust-builder", builderName))
+							trustBuilder = true
+						}
+
+						// Technically the creator is supported as of platform API version 0.3 (lifecycle version 0.7.0+) but earlier versions
+						// have bugs that make using the creator problematic.
+						lifecycleSupportsCreator := !lifecycleDescriptor.Info.Version.LessThan(semver.MustParse("0.7.4"))
+						packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
+						creatorSupported := lifecycleSupportsCreator && packSupportsCreator
+
+						usingCreator = creatorSupported && trustBuilder
 					})
 
 					it("creates a runnable, rebuildable image on daemon from app dir", func() {
 						appPath := filepath.Join("testdata", "mock_app")
+
 						output := h.Run(t, subjectPack("build", repoName, "-p", appPath))
+
 						h.AssertContains(t, output, fmt.Sprintf("Successfully built image '%s'", repoName))
 						imgId, err := imgIDForRepoName(repoName)
 						if err != nil {
@@ -698,65 +839,33 @@ func testAcceptance(
 						t.Log("app is runnable")
 						assertMockAppRunsWithOutput(t, repoName, "Launch Dep Contents", "Cached Dep Contents")
 
-						version, err := packVersion(packPath)
-						h.AssertNil(t, err)
-						packSemver = semver.MustParse(strings.TrimPrefix(strings.Split(version, " ")[0], "v"))
-						packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
-
-						lifecycleSupportsCreator := !(semver.MustParse(lifecycleDescriptor.API.PlatformVersion.String()).LessThan(semver.MustParse("0.3")))
-
 						t.Log("restores the cache")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Restoring data for "simple/layers:cached-launch-layer" from cache`)
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Restoring metadata for "simple/layers:cached-launch-layer" from app image`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[restorer] Restoring data for "simple/layers:cached-launch-layer" from cache`)
-							h.AssertContainsMatch(t, output, `(?i)\[analyzer] Restoring metadata for "simple/layers:cached-launch-layer" from app image`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Restoring data for "simple/layers:cached-launch-layer" from cache`)
+						h.AssertContainsMatch(t, output, `(?i)Restoring metadata for "simple/layers:cached-launch-layer" from app image`)
 
 						t.Log("exporter reuses unchanged layers")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] reusing layer 'simple/layers:cached-launch-layer'`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[exporter] reusing layer 'simple/layers:cached-launch-layer'`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Reusing layer 'simple/layers:cached-launch-layer'`)
 
 						t.Log("cacher reuses unchanged layers")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Reusing cache layer 'simple/layers:cached-launch-layer'`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[exporter] Reusing cache layer 'simple/layers:cached-launch-layer'`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Reusing cache layer 'simple/layers:cached-launch-layer'`)
 
 						t.Log("rebuild with --clear-cache")
 						output = h.Run(t, subjectPack("build", repoName, "-p", appPath, "--clear-cache"))
 						h.AssertContains(t, output, fmt.Sprintf("Successfully built image '%s'", repoName))
 
 						t.Log("skips restore")
-						if !lifecycleSupportsCreator || !packSupportsCreator {
+						if !usingCreator {
 							h.AssertContains(t, output, "Skipping 'restore' due to clearing cache")
 						}
 
 						t.Log("skips buildpack layer analysis")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Skipping buildpack layer analysis`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[analyzer] Skipping buildpack layer analysis`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Skipping buildpack layer analysis`)
 
 						t.Log("exporter reuses unchanged layers")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Reusing layer 'simple/layers:cached-launch-layer'`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[exporter] reusing layer 'simple/layers:cached-launch-layer'`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Reusing layer 'simple/layers:cached-launch-layer'`)
 
 						t.Log("cacher adds layers")
-						if lifecycleSupportsCreator && packSupportsCreator {
-							h.AssertContainsMatch(t, output, `(?i)\[creator] Adding cache layer 'simple/layers:cached-launch-layer'`)
-						} else {
-							h.AssertContainsMatch(t, output, `(?i)\[exporter] Adding cache layer 'simple/layers:cached-launch-layer'`)
-						}
+						h.AssertContainsMatch(t, output, `(?i)Adding cache layer 'simple/layers:cached-launch-layer'`)
 
 						if packSupports(packPath, "inspect-image") {
 							t.Log("inspect-image")
@@ -815,19 +924,7 @@ func testAcceptance(
 									"--buildpack", buildpackTgz,
 								))
 
-								version, err := packVersion(packPath)
-								h.AssertNil(t, err)
-								packSemver = semver.MustParse(strings.TrimPrefix(strings.Split(version, " ")[0], "v"))
-								packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
-
-								lifecycleSupportsCreator := !(semver.MustParse(lifecycleDescriptor.API.PlatformVersion.String()).LessThan(semver.MustParse("0.3")))
-
-								if lifecycleSupportsCreator && packSupportsCreator {
-									h.AssertContains(t, output, "[creator] RESULT: Connected to the internet")
-								} else {
-									h.AssertContains(t, output, "[detector] RESULT: Connected to the internet")
-									h.AssertContains(t, output, "[builder] RESULT: Connected to the internet")
-								}
+								h.AssertContains(t, output, "RESULT: Connected to the internet")
 							})
 						})
 
@@ -839,19 +936,7 @@ func testAcceptance(
 									"--buildpack", buildpackTgz,
 								))
 
-								version, err := packVersion(packPath)
-								h.AssertNil(t, err)
-								packSemver = semver.MustParse(strings.TrimPrefix(strings.Split(version, " ")[0], "v"))
-								packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
-
-								lifecycleSupportsCreator := !(semver.MustParse(lifecycleDescriptor.API.PlatformVersion.String()).LessThan(semver.MustParse("0.3")))
-
-								if lifecycleSupportsCreator && packSupportsCreator {
-									h.AssertContains(t, output, "[creator] RESULT: Connected to the internet")
-								} else {
-									h.AssertContains(t, output, "[detector] RESULT: Connected to the internet")
-									h.AssertContains(t, output, "[builder] RESULT: Connected to the internet")
-								}
+								h.AssertContains(t, output, "RESULT: Connected to the internet")
 							})
 						})
 
@@ -868,19 +953,7 @@ func testAcceptance(
 									"none",
 								))
 
-								version, err := packVersion(packPath)
-								h.AssertNil(t, err)
-								packSemver = semver.MustParse(strings.TrimPrefix(strings.Split(version, " ")[0], "v"))
-								packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
-
-								lifecycleSupportsCreator := !(semver.MustParse(lifecycleDescriptor.API.PlatformVersion.String()).LessThan(semver.MustParse("0.3")))
-
-								if lifecycleSupportsCreator && packSupportsCreator {
-									h.AssertContains(t, output, "[creator] RESULT: Disconnected from the internet")
-								} else {
-									h.AssertContains(t, output, "[detector] RESULT: Disconnected from the internet")
-									h.AssertContains(t, output, "[builder] RESULT: Disconnected from the internet")
-								}
+								h.AssertContains(t, output, "RESULT: Disconnected from the internet")
 							})
 						})
 					})
@@ -889,9 +962,16 @@ func testAcceptance(
 						var buildpackTgz, tempVolume string
 
 						it.Before(func() {
+							packVer, err := packVersion(packPath)
+							h.AssertNil(t, err)
+							packSemver := semver.MustParse(strings.TrimPrefix(strings.Split(packVer, " ")[0], "v"))
+							h.SkipIf(t,
+								packSemver.Equal(semver.MustParse("0.11.0")),
+								"pack 0.11.0 shipped with a volume mounting bug",
+							)
+
 							buildpackTgz = h.CreateTGZ(t, filepath.Join(bpDir, "volume-buildpack"), "./", 0755)
 
-							var err error
 							tempVolume, err = ioutil.TempDir("", "my-volume-mount-source")
 							h.AssertNil(t, err)
 							h.AssertNil(t, os.Chmod(tempVolume, 0755)) // Override umask
@@ -906,10 +986,10 @@ func testAcceptance(
 						})
 
 						it.After(func() {
-							h.AssertNil(t, os.Remove(buildpackTgz))
-							h.AssertNil(t, h.DockerRmi(dockerCli, repoName))
+							_ = os.Remove(buildpackTgz)
+							_ = h.DockerRmi(dockerCli, repoName)
 
-							h.AssertNil(t, os.RemoveAll(tempVolume))
+							_ = os.RemoveAll(tempVolume)
 						})
 
 						it("mounts the provided volume in the detect and build phases", func() {
@@ -921,9 +1001,9 @@ func testAcceptance(
 							))
 
 							if packSemver.GreaterThan(semver.MustParse("0.9.0")) || packSemver.Equal(semver.MustParse("0.0.0")) {
-								h.AssertContains(t, output, "Detect: Reading file '/platform/my-volume-mount-target/some-file':")
+								h.AssertContains(t, output, "Detect: Reading file '/platform/my-volume-mount-target/some-file': some-string")
 							}
-							h.AssertContains(t, output, "Build: Reading file '/platform/my-volume-mount-target/some-file':")
+							h.AssertContains(t, output, "Build: Reading file '/platform/my-volume-mount-target/some-file': some-string")
 						})
 					})
 
@@ -942,7 +1022,6 @@ func testAcceptance(
 							))
 
 							assertMockAppLogs(t, repoName, "hello world")
-
 						})
 					})
 
@@ -1295,25 +1374,15 @@ func testAcceptance(
 						it("stops the execution", func() {
 							var buf bytes.Buffer
 							cmd := subjectPack("build", repoName, "-p", filepath.Join("testdata", "mock_app"))
+
 							cmd.Stdout = &buf
 							cmd.Stderr = &buf
 
 							h.AssertNil(t, cmd.Start())
 
-							version, err := packVersion(packPath)
-							h.AssertNil(t, err)
-							packSemver = semver.MustParse(strings.TrimPrefix(strings.Split(version, " ")[0], "v"))
-							packSupportsCreator := packSemver.GreaterThan(semver.MustParse("0.10.0")) || packSemver.Equal(semver.MustParse("0.0.0"))
+							go terminateAtOutput(t, cmd, &buf, "DETECTING")
 
-							lifecycleSupportsCreator := !(semver.MustParse(lifecycleDescriptor.API.PlatformVersion.String()).LessThan(semver.MustParse("0.3")))
-
-							if lifecycleSupportsCreator && packSupportsCreator {
-								go terminateAtStep(t, cmd, &buf, "[creator]")
-							} else {
-								go terminateAtStep(t, cmd, &buf, "[detector]")
-							}
-
-							err = cmd.Wait()
+							err := cmd.Wait()
 							h.AssertNotNil(t, err)
 							h.AssertNotContains(t, buf.String(), "Successfully built image")
 						})
@@ -1432,24 +1501,13 @@ include = [ "*.jar", "media/mountain.jpg", "media/person.png" ]
 						})
 					})
 				})
-
-				when("default builder is not set", func() {
-					it("informs the user", func() {
-						cmd := subjectPack("build", repoName, "-p", filepath.Join("testdata", "mock_app"))
-						output, err := h.RunE(cmd)
-						h.AssertNotNil(t, err)
-						h.AssertContains(t, output, `Please select a default builder with:`)
-						h.AssertMatch(t, output, `Cloud Foundry:\s+'cloudfoundry/cnb:bionic'`)
-						h.AssertMatch(t, output, `Cloud Foundry:\s+'cloudfoundry/cnb:cflinuxfs3'`)
-						h.AssertMatch(t, output, `Heroku:\s+'heroku/buildpacks:18'`)
-					})
-				})
 			})
 
 			when("inspect-builder", func() {
 				it("displays configuration for a builder (local and remote)", func() {
-					configuredRunImage := "some-registry.com/pack-test/run1"
-					output := h.Run(t, subjectPack("set-run-image-mirrors", "pack-test/run", "--mirror", configuredRunImage))
+					output := h.Run(t, subjectPack(
+						"set-run-image-mirrors", "pack-test/run", "--mirror", "some-registry.com/pack-test/run1",
+					))
 					h.AssertEq(t, output, "Run Image 'pack-test/run' configured with mirror 'some-registry.com/pack-test/run1'\n")
 
 					output = h.Run(t, subjectPack("inspect-builder", builderName))
@@ -1476,6 +1534,46 @@ include = [ "*.jar", "media/mountain.jpg", "media/person.png" ]
 							"platform_api_version":  lifecycleDescriptor.API.PlatformVersion.String(),
 							"run_image_mirror":      runImageMirror,
 							"pack_version":          createdByVersion,
+							"trusted":               "No",
+						},
+					)
+
+					h.AssertEq(t, output, expectedOutput)
+				})
+
+				it("indicates builder is trusted", func() {
+					h.SkipIf(t, !packSupports(packPath, "trust-builder"), "version of pack doesn't trust-builder command")
+
+					_ = h.Run(t, subjectPack("trust-builder", builderName))
+					_ = h.Run(t, subjectPack(
+						"set-run-image-mirrors", "pack-test/run", "--mirror", "some-registry.com/pack-test/run1",
+					))
+
+					output := h.Run(t, subjectPack("inspect-builder", builderName))
+
+					// Get version of pack that had created the builder
+					createdByVersion, err := packVersion(packCreateBuilderPath)
+					h.AssertNil(t, err)
+
+					outputTemplate := filepath.Join(packFixturesDir, "inspect_builder_output.txt")
+
+					// If a different version of pack had created the builder, we need a different (versioned) template for expected output
+					versionedTemplate := filepath.Join(packFixturesDir, fmt.Sprintf("inspect_%s_builder_output.txt", strings.TrimPrefix(strings.Split(createdByVersion, " ")[0], "v")))
+					if _, err := os.Stat(versionedTemplate); err == nil {
+						outputTemplate = versionedTemplate
+					} else if !os.IsNotExist(err) {
+						t.Fatal(err.Error())
+					}
+
+					expectedOutput := fillTemplate(t, outputTemplate,
+						map[string]interface{}{
+							"builder_name":          builderName,
+							"lifecycle_version":     lifecycleDescriptor.Info.Version.String(),
+							"buildpack_api_version": lifecycleDescriptor.API.BuildpackVersion.String(),
+							"platform_api_version":  lifecycleDescriptor.API.PlatformVersion.String(),
+							"run_image_mirror":      runImageMirror,
+							"pack_version":          createdByVersion,
+							"trusted":               "Yes",
 						},
 					)
 
@@ -1729,12 +1827,14 @@ func buildPack(t *testing.T, compileVersion string) string {
 	return packPath
 }
 
-func createBuilder(t *testing.T, runImageMirror, configDir, packPath, lifecyclePath string, lifecycleDescriptor builder.LifecycleDescriptor) string {
+func createBuilder(t *testing.T, runImageMirror, configDir, packHome, packPath, lifecyclePath string, lifecycleDescriptor builder.LifecycleDescriptor) (string, error) {
 	t.Log("creating builder image...")
 
 	// CREATE TEMP WORKING DIR
 	tmpDir, err := ioutil.TempDir("", "create-test-builder")
-	h.AssertNil(t, err)
+	if err != nil {
+		return "", err
+	}
 	defer os.RemoveAll(tmpDir)
 
 	// DETERMINE TEST DATA
@@ -1753,7 +1853,9 @@ func createBuilder(t *testing.T, runImageMirror, configDir, packPath, lifecycleP
 	for _, v := range buildpacks {
 		tgz := h.CreateTGZ(t, filepath.Join(buildpacksDir, v), "./", 0755)
 		err := os.Rename(tgz, filepath.Join(tmpDir, v+".tgz"))
-		h.AssertNil(t, err)
+		if err != nil {
+			return "", err
+		}
 	}
 
 	var packageImageName string
@@ -1791,18 +1893,24 @@ func createBuilder(t *testing.T, runImageMirror, configDir, packPath, lifecycleP
 	})
 
 	err = ioutil.WriteFile(filepath.Join(tmpDir, "builder.toml"), []byte(cfgData), os.ModePerm)
-	h.AssertNil(t, err)
+	if err != nil {
+		return "", err
+	}
 
 	// NAME BUILDER
 	bldr := registryConfig.RepoName("test/builder-" + h.RandString(10))
 
 	// CREATE BUILDER
-	cmd := exec.Command(packPath, "create-builder", "--no-color", bldr, "-b", filepath.Join(tmpDir, "builder.toml"))
-	output := h.Run(t, cmd)
+	cmd := packCmd(packHome, packPath, "create-builder", "--no-color", bldr, "-b", filepath.Join(tmpDir, "builder.toml"))
+	output, err := h.RunE(cmd)
+	if err != nil {
+		return "", err
+	}
+
 	h.AssertContains(t, output, fmt.Sprintf("Successfully created builder image '%s'", bldr))
 	h.AssertNil(t, h.PushImage(dockerCli, bldr, registryConfig))
 
-	return bldr
+	return bldr, nil
 }
 
 func packageBuildpackAsImage(t *testing.T, packPath, configPath string, lifecycleDescriptor builder.LifecycleDescriptor, buildpacks []string) string {
@@ -2032,7 +2140,8 @@ func waitForResponse(t *testing.T, port string, timeout time.Duration) string {
 }
 
 // FIXME : buf needs a mutex
-func terminateAtStep(t *testing.T, cmd *exec.Cmd, buf *bytes.Buffer, pattern string) {
+// terminateAtOutput terminates the command when output is present in buffer.
+func terminateAtOutput(t *testing.T, cmd *exec.Cmd, buf *bytes.Buffer, pattern string) {
 	t.Helper()
 	var interruptSignal os.Signal
 

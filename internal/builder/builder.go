@@ -18,7 +18,6 @@ import (
 	"github.com/pkg/errors"
 
 	"github.com/buildpacks/pack/builder"
-	"github.com/buildpacks/pack/cmd"
 	"github.com/buildpacks/pack/internal/api"
 	"github.com/buildpacks/pack/internal/archive"
 	"github.com/buildpacks/pack/internal/dist"
@@ -34,7 +33,7 @@ const (
 	cnbDir = "/cnb"
 
 	orderPath          = "/cnb/order.toml"
-	stackPath          = "/cnb/stack.toml"
+	StackPath          = "/cnb/stack.toml"
 	platformDir        = "/platform"
 	lifecycleDir       = "/cnb/lifecycle"
 	compatLifecycleDir = "/lifecycle"
@@ -44,10 +43,11 @@ const (
 	metadataLabel = "io.buildpacks.builder.metadata"
 	stackLabel    = "io.buildpacks.stack.id"
 
-	envUID = "CNB_USER_ID"
-	envGID = "CNB_GROUP_ID"
+	EnvUID = "CNB_USER_ID"
+	EnvGID = "CNB_GROUP_ID"
 )
 
+// Builder represents a pack builder, used to build images
 type Builder struct {
 	baseImageName        string
 	image                imgutil.Image
@@ -79,7 +79,7 @@ func FromImage(img imgutil.Image) (*Builder, error) {
 	return constructBuilder(img, "", metadata)
 }
 
-// New constructs a new builder from base image
+// New constructs a new builder from a base image
 func New(baseImage imgutil.Image, name string) (*Builder, error) {
 	var metadata Metadata
 	if _, err := dist.GetLabel(baseImage, metadataLabel, &metadata); err != nil {
@@ -162,76 +162,92 @@ func constructBuilder(img imgutil.Image, newName string, metadata Metadata) (*Bu
 
 // Getters
 
+// Description returns the builder description
 func (b *Builder) Description() string {
 	return b.metadata.Description
 }
 
+// LifecycleDescriptor returns the LifecycleDescriptor
 func (b *Builder) LifecycleDescriptor() LifecycleDescriptor {
 	return b.lifecycleDescriptor
 }
 
+// Buildpacks returns the buildpack list
 func (b *Builder) Buildpacks() []dist.BuildpackInfo {
 	return b.metadata.Buildpacks
 }
 
+// CreatedBy returns metadata around the creation of the builder
 func (b *Builder) CreatedBy() CreatorMetadata {
 	return b.metadata.CreatedBy
 }
 
+// Order returns the order
 func (b *Builder) Order() dist.Order {
 	return b.order
 }
 
+// Name returns the name of the builder
 func (b *Builder) Name() string {
 	return b.image.Name()
 }
 
+// Image returns the base image
 func (b *Builder) Image() imgutil.Image {
 	return b.image
 }
 
+// Stack returns the stack metadata
 func (b *Builder) Stack() StackMetadata {
 	return b.metadata.Stack
 }
 
+// Mixins returns the mixins of the builder
 func (b *Builder) Mixins() []string {
 	return b.mixins
 }
 
+// UID returns the UID of the builder
 func (b *Builder) UID() int {
 	return b.uid
 }
 
+// GID returns the GID of the builder
 func (b *Builder) GID() int {
 	return b.gid
 }
 
 // Setters
 
+// AddBuildpack adds a buildpack to the builder
 func (b *Builder) AddBuildpack(bp dist.Buildpack) {
 	b.additionalBuildpacks = append(b.additionalBuildpacks, bp)
 	b.metadata.Buildpacks = append(b.metadata.Buildpacks, bp.Descriptor().Info)
 }
 
-func (b *Builder) SetLifecycle(lifecycle Lifecycle) error {
+// SetLifecycle sets the lifecycle of the builder
+func (b *Builder) SetLifecycle(lifecycle Lifecycle) {
 	b.lifecycle = lifecycle
 	b.lifecycleDescriptor = lifecycle.Descriptor()
-	return nil
 }
 
+// SetEnv sets an environment variable to a value
 func (b *Builder) SetEnv(env map[string]string) {
 	b.env = env
 }
 
+// SetOrder sets the order of the builder
 func (b *Builder) SetOrder(order dist.Order) {
 	b.order = order
 	b.replaceOrder = true
 }
 
+// SetDescription sets the description of the builder
 func (b *Builder) SetDescription(description string) {
 	b.metadata.Description = description
 }
 
+// SetStack sets the stack of the builder
 func (b *Builder) SetStack(stackConfig builder.StackConfig) {
 	b.metadata.Stack = StackMetadata{
 		RunImage: RunImageMetadata{
@@ -241,7 +257,13 @@ func (b *Builder) SetStack(stackConfig builder.StackConfig) {
 	}
 }
 
-func (b *Builder) Save(logger logging.Logger) error {
+// Save saves the builder
+func (b *Builder) Save(logger logging.Logger, creatorMetadata CreatorMetadata) error {
+	logger.Debugf("Creating builder with the following buildpacks:")
+	for _, bpInfo := range b.metadata.Buildpacks {
+		logger.Debugf("-> %s", style.Symbol(bpInfo.FullName()))
+	}
+
 	resolvedOrder, err := processOrder(b.metadata.Buildpacks, b.order)
 	if err != nil {
 		return errors.Wrap(err, "processing order")
@@ -348,10 +370,11 @@ func (b *Builder) Save(logger logging.Logger) error {
 		return errors.Wrap(err, "adding env layer")
 	}
 
-	b.metadata.CreatedBy = CreatorMetadata{
-		Name:    packName,
-		Version: cmd.Version,
+	if creatorMetadata.Name == "" {
+		creatorMetadata.Name = packName
 	}
+
+	b.metadata.CreatedBy = creatorMetadata
 
 	if err := dist.SetLabel(b.image, metadataLabel, b.metadata); err != nil {
 		return err
@@ -458,29 +481,29 @@ func validateBuildpacks(stackID string, mixins []string, lifecycleDescriptor Lif
 }
 
 func userAndGroupIDs(img imgutil.Image) (int, int, error) {
-	sUID, err := img.Env(envUID)
+	sUID, err := img.Env(EnvUID)
 	if err != nil {
 		return 0, 0, errors.Wrap(err, "reading builder env variables")
 	} else if sUID == "" {
-		return 0, 0, fmt.Errorf("image %s missing required env var %s", style.Symbol(img.Name()), style.Symbol(envUID))
+		return 0, 0, fmt.Errorf("image %s missing required env var %s", style.Symbol(img.Name()), style.Symbol(EnvUID))
 	}
 
-	sGID, err := img.Env(envGID)
+	sGID, err := img.Env(EnvGID)
 	if err != nil {
 		return 0, 0, errors.Wrap(err, "reading builder env variables")
 	} else if sGID == "" {
-		return 0, 0, fmt.Errorf("image %s missing required env var %s", style.Symbol(img.Name()), style.Symbol(envGID))
+		return 0, 0, fmt.Errorf("image %s missing required env var %s", style.Symbol(img.Name()), style.Symbol(EnvGID))
 	}
 
 	var uid, gid int
 	uid, err = strconv.Atoi(sUID)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to parse %s, value %s should be an integer", style.Symbol(envUID), style.Symbol(sUID))
+		return 0, 0, fmt.Errorf("failed to parse %s, value %s should be an integer", style.Symbol(EnvUID), style.Symbol(sUID))
 	}
 
 	gid, err = strconv.Atoi(sGID)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to parse %s, value %s should be an integer", style.Symbol(envGID), style.Symbol(sGID))
+		return 0, 0, fmt.Errorf("failed to parse %s, value %s should be an integer", style.Symbol(EnvGID), style.Symbol(sGID))
 	}
 
 	return uid, gid, nil
@@ -578,7 +601,7 @@ func (b *Builder) stackLayer(dest string) (string, error) {
 	}
 
 	layerTar := filepath.Join(dest, "stack.tar")
-	err = layer.CreateSingleFileTar(layerTar, stackPath, buf.String(), b.layerWriterFactory)
+	err = layer.CreateSingleFileTar(layerTar, StackPath, buf.String(), b.layerWriterFactory)
 	if err != nil {
 		return "", errors.Wrapf(err, "failed to create stack.toml layer tar")
 	}

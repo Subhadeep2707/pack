@@ -1,12 +1,21 @@
 package build
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io/ioutil"
+	"os"
+	"path/filepath"
 
+	"github.com/BurntSushi/toml"
 	"github.com/Masterminds/semver"
 	"github.com/buildpacks/lifecycle/auth"
+	"github.com/docker/docker/api/types/mount"
 	"github.com/google/go-containerregistry/pkg/authn"
+	"github.com/pkg/errors"
+
+	"github.com/buildpacks/pack/internal/builder"
 )
 
 const (
@@ -27,7 +36,12 @@ type PhaseFactory interface {
 	New(provider *PhaseConfigProvider) RunnerCleaner
 }
 
-func (l *Lifecycle) Create(ctx context.Context, publish, clearCache bool, runImage, launchCacheName, cacheName, repoName, networkMode string, phaseFactory PhaseFactory) error {
+func (l *Lifecycle) Create(
+	ctx context.Context,
+	publish, clearCache bool,
+	runImage, launchCacheName, cacheName, repoName, networkMode string,
+	volumes []string,
+	phaseFactory PhaseFactory) error {
 	var configProvider *PhaseConfigProvider
 
 	args := []string{
@@ -35,7 +49,7 @@ func (l *Lifecycle) Create(ctx context.Context, publish, clearCache bool, runIma
 		repoName,
 	}
 
-	binds := []string{fmt.Sprintf("%s:%s", cacheName, cacheDir)}
+	binds := append(volumes, fmt.Sprintf("%s:%s", cacheName, cacheDir))
 
 	if clearCache {
 		args = append([]string{"-skip-restore"}, args...)
@@ -43,10 +57,12 @@ func (l *Lifecycle) Create(ctx context.Context, publish, clearCache bool, runIma
 
 	args = append([]string{"-cache-dir", cacheDir}, args...)
 
-	if l.DefaultProcessType != "" && l.supportsDefaultProcess() {
-		args = append([]string{"-process-type", l.DefaultProcessType}, args...)
-	} else {
-		l.logger.Warn("You specified a default process type but that is not supported by this version of the lifecycle")
+	if l.DefaultProcessType != "" {
+		if l.supportsDefaultProcess() {
+			args = append([]string{"-process-type", l.DefaultProcessType}, args...)
+		} else {
+			l.logger.Warn("You specified a default process type but that is not supported by this version of the lifecycle")
+		}
 	}
 
 	if !publish {
@@ -97,6 +113,7 @@ func (l *Lifecycle) Detect(ctx context.Context, networkMode string, volumes []st
 	configProvider := NewPhaseConfigProvider(
 		"detector",
 		l,
+		WithLogPrefix("detector"),
 		WithArgs(
 			l.withLogLevel(
 				"-app", appDir,
@@ -116,6 +133,9 @@ func (l *Lifecycle) Restore(ctx context.Context, cacheName, networkMode string, 
 	configProvider := NewPhaseConfigProvider(
 		"restorer",
 		l,
+		WithLogPrefix("restorer"),
+		WithImage(l.lifecycleImage),
+		WithEnv(fmt.Sprintf("%s=%d", builder.EnvUID, l.builder.UID()), fmt.Sprintf("%s=%d", builder.EnvGID, l.builder.GID())),
 		WithRoot(), // remove after platform API 0.2 is no longer supported
 		WithArgs(
 			l.withLogLevel(
@@ -161,9 +181,12 @@ func (l *Lifecycle) newAnalyze(repoName, cacheName, networkMode string, publish,
 		configProvider := NewPhaseConfigProvider(
 			"analyzer",
 			l,
+			WithLogPrefix("analyzer"),
+			WithImage(l.lifecycleImage),
+			WithEnv(fmt.Sprintf("%s=%d", builder.EnvUID, l.builder.UID()), fmt.Sprintf("%s=%d", builder.EnvGID, l.builder.GID())),
 			WithRegistryAccess(authConfig),
 			WithRoot(),
-			WithArgs(args...),
+			WithArgs(l.withLogLevel(args...)...),
 			WithNetwork(networkMode),
 			WithBinds(fmt.Sprintf("%s:%s", cacheName, cacheDir)),
 		)
@@ -171,9 +194,13 @@ func (l *Lifecycle) newAnalyze(repoName, cacheName, networkMode string, publish,
 		return phaseFactory.New(configProvider), nil
 	}
 
+	// TODO: when platform API 0.2 is no longer supported we can delete this code: https://github.com/buildpacks/pack/issues/629.
 	configProvider := NewPhaseConfigProvider(
 		"analyzer",
 		l,
+		WithLogPrefix("analyzer"),
+		WithImage(l.lifecycleImage),
+		WithEnv(fmt.Sprintf("%s=%d", builder.EnvUID, l.builder.UID()), fmt.Sprintf("%s=%d", builder.EnvGID, l.builder.GID())),
 		WithDaemonAccess(),
 		WithArgs(
 			l.withLogLevel(
@@ -195,14 +222,22 @@ func prependArg(arg string, args []string) []string {
 }
 
 func (l *Lifecycle) Build(ctx context.Context, networkMode string, volumes []string, phaseFactory PhaseFactory) error {
+	args := []string{
+		"-layers", layersDir,
+		"-app", appDir,
+		"-platform", platformDir,
+	}
+
+	platformAPIVersion := semver.MustParse(l.platformAPIVersion)
+	if semver.MustParse("0.2").LessThan(platformAPIVersion) { // lifecycle did not support log level for build until platform api 0.3
+		args = l.withLogLevel(args...)
+	}
+
 	configProvider := NewPhaseConfigProvider(
 		"builder",
 		l,
-		WithArgs(
-			"-layers", layersDir,
-			"-app", appDir,
-			"-platform", platformDir,
-		),
+		WithLogPrefix("builder"),
+		WithArgs(args...),
 		WithNetwork(networkMode),
 		WithBinds(volumes...),
 	)
@@ -213,7 +248,16 @@ func (l *Lifecycle) Build(ctx context.Context, networkMode string, volumes []str
 }
 
 func (l *Lifecycle) Export(ctx context.Context, repoName string, runImage string, publish bool, launchCacheName, cacheName, networkMode string, phaseFactory PhaseFactory) error {
-	export, err := l.newExport(repoName, runImage, publish, launchCacheName, cacheName, networkMode, phaseFactory)
+	var stackMount mount.Mount
+	stackPath, err := l.writeStackToml()
+	if err != nil {
+		return errors.Wrap(err, "writing stack toml")
+	}
+	defer os.Remove(stackPath)
+
+	stackMount = mount.Mount{Type: "bind", Source: stackPath, Target: builder.StackPath, ReadOnly: true}
+
+	export, err := l.newExport(repoName, runImage, publish, launchCacheName, cacheName, networkMode, []mount.Mount{stackMount}, phaseFactory)
 	if err != nil {
 		return err
 	}
@@ -221,7 +265,7 @@ func (l *Lifecycle) Export(ctx context.Context, repoName string, runImage string
 	return export.Run(ctx)
 }
 
-func (l *Lifecycle) newExport(repoName, runImage string, publish bool, launchCacheName, cacheName, networkMode string, phaseFactory PhaseFactory) (RunnerCleaner, error) {
+func (l *Lifecycle) newExport(repoName, runImage string, publish bool, launchCacheName, cacheName, networkMode string, mounts []mount.Mount, phaseFactory PhaseFactory) (RunnerCleaner, error) {
 	args := l.exportImageArgs(runImage)
 	args = append(args, []string{
 		"-cache-dir", cacheDir,
@@ -232,10 +276,12 @@ func (l *Lifecycle) newExport(repoName, runImage string, publish bool, launchCac
 
 	binds := []string{fmt.Sprintf("%s:%s", cacheName, cacheDir)}
 
-	if l.DefaultProcessType != "" && l.supportsDefaultProcess() {
-		args = append([]string{"-process-type", l.DefaultProcessType}, args...)
-	} else {
-		l.logger.Warn("You specified a default process type but that is not supported by this version of the lifecycle")
+	if l.DefaultProcessType != "" {
+		if l.supportsDefaultProcess() {
+			args = append([]string{"-process-type", l.DefaultProcessType}, args...)
+		} else {
+			l.logger.Warn("You specified a default process type but that is not supported by this version of the lifecycle")
+		}
 	}
 
 	if publish {
@@ -247,6 +293,9 @@ func (l *Lifecycle) newExport(repoName, runImage string, publish bool, launchCac
 		configProvider := NewPhaseConfigProvider(
 			"exporter",
 			l,
+			WithLogPrefix("exporter"),
+			WithImage(l.lifecycleImage),
+			WithEnv(fmt.Sprintf("%s=%d", builder.EnvUID, l.builder.UID()), fmt.Sprintf("%s=%d", builder.EnvGID, l.builder.GID())),
 			WithRegistryAccess(authConfig),
 			WithArgs(
 				l.withLogLevel(args...)...,
@@ -254,26 +303,58 @@ func (l *Lifecycle) newExport(repoName, runImage string, publish bool, launchCac
 			WithRoot(),
 			WithNetwork(networkMode),
 			WithBinds(binds...),
+			WithMounts(mounts...),
 		)
 
 		return phaseFactory.New(configProvider), nil
 	}
 
+	// TODO: when platform API 0.2 is no longer supported we can delete this code: https://github.com/buildpacks/pack/issues/629.
 	args = append([]string{"-daemon", "-launch-cache", launchCacheDir}, args...)
 	binds = append(binds, fmt.Sprintf("%s:%s", launchCacheName, launchCacheDir))
 
 	configProvider := NewPhaseConfigProvider(
 		"exporter",
 		l,
+		WithLogPrefix("exporter"),
+		WithImage(l.lifecycleImage),
+		WithEnv(fmt.Sprintf("%s=%d", builder.EnvUID, l.builder.UID()), fmt.Sprintf("%s=%d", builder.EnvGID, l.builder.GID())),
 		WithDaemonAccess(),
 		WithArgs(
 			l.withLogLevel(args...)...,
 		),
 		WithNetwork(networkMode),
 		WithBinds(binds...),
+		WithMounts(mounts...),
 	)
 
 	return phaseFactory.New(configProvider), nil
+}
+
+func (l *Lifecycle) writeStackToml() (string, error) {
+	buf := &bytes.Buffer{}
+	err := toml.NewEncoder(buf).Encode(l.builder.Stack())
+	if err != nil {
+		return "", errors.Wrap(err, "marshaling stack metadata")
+	}
+
+	var stackFile *os.File
+	if stackFile, err = ioutil.TempFile("", "stack.toml"); err != nil {
+		return "", errors.Wrap(err, "opening stack.toml tempfile")
+	}
+
+	if _, err = stackFile.Write(buf.Bytes()); err != nil {
+		return "", errors.Wrapf(err, "writing stack.toml tempfile: %s", stackFile.Name())
+	}
+
+	// Override umask
+	if err = os.Chmod(stackFile.Name(), 0755); err != nil {
+		return "", errors.Wrapf(err, "overriding umask for stack.toml tempfile: %s", stackFile.Name())
+	}
+
+	// Some OSes (like macOS) use symlinks for the standard temp dir.
+	// Resolve it so it can be properly mounted by the Docker daemon.
+	return filepath.EvalSymlinks(stackFile.Name())
 }
 
 func (l *Lifecycle) withLogLevel(args ...string) []string {

@@ -84,7 +84,7 @@ func NewGithubAssetFetcher(githubToken string, logger logging.Logger) (*GithubAs
 // The return value is the location of the asset on disk, or any error encountered.
 func (f *GithubAssetFetcher) FetchReleaseAsset(owner, repo, version string, expr *regexp.Regexp, extract bool) (string, error) {
 	if destPath, _ := f.cachedAsset(owner, repo, version, expr); destPath != "" {
-		f.logger.Infof("found %s in cache for %s/%s %s", destPath, owner, repo, version)
+		f.logger.Infof("found %s in cache for %s/%s@%s", destPath, owner, repo, version)
 		return destPath, nil
 	}
 
@@ -159,7 +159,7 @@ func extractType(extract bool, assetName string) string {
 
 func (f *GithubAssetFetcher) FetchReleaseSource(owner, repo, version string) (string, error) {
 	if destDir, _ := f.cachedSource(owner, repo, version); destDir != "" {
-		f.logger.Infof("found %s in cache for %s/%s %s", destDir, owner, repo, version)
+		f.logger.Infof("found %s in cache for %s/%s@%s", destDir, owner, repo, version)
 		return destDir, nil
 	}
 
@@ -191,17 +191,28 @@ func (f *GithubAssetFetcher) FetchReleaseSource(owner, repo, version string) (st
 // Ex: when n is -1, the latest patch of the previous minor version is returned.
 func (f *GithubAssetFetcher) FetchReleaseVersion(owner, repo string, n int) (string, error) {
 	if version, _ := f.cachedVersion(owner, repo, n); version != "" {
-		f.logger.Infof("found %s in cache for %s/%s %d", version, owner, repo, n)
+		f.logger.Infof("found %s in cache for %s/%s n%d", version, owner, repo, n)
 		return version, nil
 	}
 
 	// get all release versions
-	releases, _, err := f.githubClient.Repositories.ListReleases(f.ctx, owner, repo, nil)
+	rawReleases, _, err := f.githubClient.Repositories.ListReleases(f.ctx, owner, repo, nil)
 	if err != nil {
 		return "", errors.Wrap(err, "listing releases")
 	}
-	if len(releases) == 0 {
+	if len(rawReleases) == 0 {
 		return "", fmt.Errorf("no releases found for %s/%s", owner, repo)
+	}
+
+	// exclude drafts
+	var releases []*github.RepositoryRelease
+	for _, release := range rawReleases {
+		if !*release.Draft {
+			releases = append(releases, release)
+		}
+	}
+	if len(releases) == 0 {
+		return "", fmt.Errorf("no non-draft releases found for %s/%s", owner, repo)
 	}
 
 	// sort all release versions

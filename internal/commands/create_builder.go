@@ -3,13 +3,12 @@ package commands
 import (
 	"fmt"
 
-	"github.com/buildpacks/pack/internal/config"
-
 	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"github.com/buildpacks/pack"
 	"github.com/buildpacks/pack/builder"
+	"github.com/buildpacks/pack/internal/config"
 	"github.com/buildpacks/pack/internal/style"
 	"github.com/buildpacks/pack/logging"
 )
@@ -21,10 +20,15 @@ type CreateBuilderFlags struct {
 	Registry        string
 }
 
-func (c CreateBuilderFlags) validate() error {
-	if c.Publish && c.NoPull {
+func validateCreateBuilderFlags(flags CreateBuilderFlags, cfg config.Config) error {
+	if flags.Publish && flags.NoPull {
 		return errors.Errorf("The --publish and --no-pull flags cannot be used together. The --publish flag requires the use of remote images.")
 	}
+
+	if flags.Registry != "" && !cfg.Experimental {
+		return pack.NewExperimentError("Support for buildpack registries is currently experimental.")
+	}
+
 	return nil
 }
 
@@ -35,7 +39,7 @@ func CreateBuilder(logger logging.Logger, cfg config.Config, client PackClient) 
 		Args:  cobra.ExactArgs(1),
 		Short: "Create builder image",
 		RunE: logError(logger, func(cmd *cobra.Command, args []string) error {
-			if err := flags.validate(); err != nil {
+			if err := validateCreateBuilderFlags(flags, cfg); err != nil {
 				return err
 			}
 
@@ -65,6 +69,9 @@ func CreateBuilder(logger logging.Logger, cfg config.Config, client PackClient) 
 	cmd.Flags().BoolVar(&flags.NoPull, "no-pull", false, "Skip pulling build image before use")
 	cmd.Flags().StringVarP(&flags.BuilderTomlPath, "builder-config", "b", "", "Path to builder TOML file (required)")
 	cmd.Flags().StringVarP(&flags.Registry, "buildpack-registry", "R", cfg.DefaultRegistry, "Buildpack Registry URL")
+	if !cfg.Experimental {
+		cmd.Flags().MarkHidden("buildpack-registry")
+	}
 	cmd.MarkFlagRequired("builder-config")
 	cmd.Flags().BoolVar(&flags.Publish, "publish", false, "Publish to registry")
 	AddHelpFlag(cmd, "create-builder")
